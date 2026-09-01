@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.niraj-envision.mac-keybindings",
+  "name": "Mac Keybindings",
+  "version": "1.0.0",
+  "author": "niraj-envision",
+  "license": "MIT",
+  "description": "MacBook-friendly Omarchy keybindings, modifier labels, and trackpad gestures with a bar launcher.",
+  "homepage": "https://github.com/niraj-envision/omarchy-mac-keybinding",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Mac Keybindings",
+    "description": "Open the Mac-labelled keybindings menu or run the safe installer.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
