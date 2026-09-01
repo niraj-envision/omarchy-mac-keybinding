@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Omarchy keybindings menu, relabelled for a MacBook keyboard.
+# The real Hyprland modifiers and binding dispatch behavior stay unchanged.
+
+set -euo pipefail
+
+src=/usr/bin/omarchy-menu-keybindings
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-mac-keys"
+generated="$cache_dir/menu-keybindings"
+
+[[ -r $src ]] || { printf 'Cannot read %s\n' "$src" >&2; exit 1; }
+mkdir -p "$cache_dir"
+
+if [[ ! -x $generated || $src -nt $generated || ${BASH_SOURCE[0]} -nt $generated ]]; then
+  sed -E \
+    -e "/^[[:space:]]+[0-9]+\)[[:space:]]+printf '/{ s/SUPER/COMMAND/; s/CTRL/CONTROL/; s/ALT/OPTION/; }" \
+    -e 's/SUPER SHIFT\.\*/COMMAND SHIFT.*/g' \
+    -e 's/^([[:space:]]*echo ")SHIFT ALT,/\1SHIFT OPTION,/' \
+    "$src" >"$generated.tmp"
+  chmod +x "$generated.tmp"
+  mv "$generated.tmp" "$generated"
+fi
+
+# Do not mix relabelled records with the stock menu's cache.
+export XDG_CACHE_HOME="$cache_dir/xdg"
+exec bash "$generated" "$@"
