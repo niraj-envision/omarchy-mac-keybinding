@@ -1,27 +1,151 @@
-#!/bin/bash
+#!/usr/bin/env python3
+"""Render and run a Mac-labelled copy of Omarchy's keybindings menu safely."""
 
-# Omarchy keybindings menu, relabelled for a MacBook keyboard.
-# The real Hyprland modifiers and binding dispatch behavior stay unchanged.
+from __future__ import annotations
 
-set -euo pipefail
+import fcntl
+import os
+import re
+import secrets
+import stat
+import sys
+from pathlib import Path
 
-src=/usr/bin/omarchy-menu-keybindings
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-mac-keys"
-generated="$cache_dir/menu-keybindings"
+SOURCE = Path("/usr/bin/omarchy-menu-keybindings")
+MAX_SOURCE_BYTES = 2 * 1024 * 1024
 
-[[ -r $src ]] || { printf 'Cannot read %s\n' "$src" >&2; exit 1; }
-mkdir -p "$cache_dir"
 
-if [[ ! -x $generated || $src -nt $generated || ${BASH_SOURCE[0]} -nt $generated ]]; then
-  sed -E \
-    -e "/^[[:space:]]+[0-9]+\)[[:space:]]+printf '/{ s/SUPER/COMMAND/; s/CTRL/CONTROL/; s/ALT/OPTION/; }" \
-    -e 's/SUPER SHIFT\.\*/COMMAND SHIFT.*/g' \
-    -e 's/^([[:space:]]*echo ")SHIFT ALT,/\1SHIFT OPTION,/' \
-    "$src" >"$generated.tmp"
-  chmod +x "$generated.tmp"
-  mv "$generated.tmp" "$generated"
-fi
+def fail(message: str) -> "NoReturn":
+    print(f"omarchy-menu-keybindings-mac: {message}", file=sys.stderr)
+    raise SystemExit(1)
 
-# Do not mix relabelled records with the stock menu's cache.
-export XDG_CACHE_HOME="$cache_dir/xdg"
-exec bash "$generated" "$@"
+
+def require_owned_directory(path: Path, *, create: bool = False) -> None:
+    raw_home = os.environ.get("HOME")
+    if not raw_home or not os.path.isabs(raw_home):
+        fail("HOME must be an absolute path")
+    home = Path(raw_home).resolve(strict=True)
+    try:
+        path.resolve(strict=False).relative_to(home)
+    except ValueError:
+        fail(f"cache path is outside HOME: {path}")
+    current = home
+    for part in path.resolve(strict=False).relative_to(home).parts:
+        current /= part
+        if not current.exists():
+            if not create:
+                fail(f"directory does not exist: {current}")
+            os.mkdir(current, 0o700)
+        st = os.lstat(current)
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            fail(f"not a real directory: {current}")
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            fail(f"unsafe directory ownership or mode: {current}")
+
+
+def read_source() -> tuple[bytes, os.stat_result]:
+    st = os.lstat(SOURCE)
+    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        fail(f"source is not a regular file: {SOURCE}")
+    if st.st_size > MAX_SOURCE_BYTES:
+        fail(f"source exceeds {MAX_SOURCE_BYTES} bytes")
+    fd = os.open(SOURCE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            fail("source changed while opening")
+        data = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_SOURCE_BYTES:
+                fail("source grew beyond the byte limit")
+    finally:
+        os.close(fd)
+    return data, st
+
+
+def existing_generated_mode(dirfd: int, name: str) -> tuple[bool, int, int]:
+    try:
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False, 0o700, 0
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+        fail("generated cache target is not a safe user-owned regular file")
+    if st.st_mode & 0o077:
+        fail("generated cache target is accessible by group or other users")
+    return True, stat.S_IMODE(st.st_mode), st.st_mtime_ns
+
+
+def render(source: str) -> str:
+    lines = []
+    case_row = re.compile(r"^[ \t]+[0-9]+\)[ \t]+printf '")
+    for line in source.splitlines(keepends=True):
+        if case_row.search(line):
+            line = line.replace("SUPER", "COMMAND").replace("CTRL", "CONTROL").replace("ALT", "OPTION")
+        line = re.sub(r"SUPER SHIFT\.\*", "COMMAND SHIFT.*", line)
+        line = re.sub(r'^(\s*echo ")SHIFT ALT,', r"\1SHIFT OPTION,", line)
+        lines.append(line)
+    return "".join(lines)
+
+
+def regenerate(cache_dir: Path, generated_name: str, source_data: bytes, source_stat: os.stat_result) -> Path:
+    dirfd = os.open(cache_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fcntl.flock(dirfd, fcntl.LOCK_EX)
+    temp_name = f".menu-keybindings.{secrets.token_hex(12)}.tmp"
+    try:
+        exists, mode, generated_mtime = existing_generated_mode(dirfd, generated_name)
+        if exists and generated_mtime >= source_stat.st_mtime_ns:
+            return cache_dir / generated_name
+        rendered = render(source_data.decode("utf-8")).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temp_name, flags, mode, dir_fd=dirfd)
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(rendered)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        latest = os.lstat(SOURCE)
+        if (latest.st_dev, latest.st_ino, latest.st_mtime_ns, latest.st_size) != (
+            source_stat.st_dev,
+            source_stat.st_ino,
+            source_stat.st_mtime_ns,
+            source_stat.st_size,
+        ):
+            fail("source changed while generating the cache")
+        existing_generated_mode(dirfd, generated_name)
+        os.replace(temp_name, generated_name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+        return cache_dir / generated_name
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=dirfd)
+        except FileNotFoundError:
+            pass
+        os.close(dirfd)
+
+
+def main() -> None:
+    raw_home = os.environ.get("HOME")
+    if not raw_home or not os.path.isabs(raw_home):
+        fail("HOME must be an absolute path")
+    cache_base = Path(os.environ.get("XDG_CACHE_HOME", Path(raw_home) / ".cache"))
+    cache_dir = cache_base / "omarchy-mac-keys"
+    require_owned_directory(cache_dir, create=True)
+    source_data, source_stat = read_source()
+    generated = regenerate(cache_dir, "menu-keybindings", source_data, source_stat)
+    env = os.environ.copy()
+    xdg_cache = cache_dir / "xdg"
+    require_owned_directory(xdg_cache, create=True)
+    env["XDG_CACHE_HOME"] = str(xdg_cache)
+    os.execve("/bin/bash", ["bash", str(generated), *sys.argv[1:]], env)
+
+
+if __name__ == "__main__":
+    main()

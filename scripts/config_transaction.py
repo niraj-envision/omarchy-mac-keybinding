@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Transactional, fail-closed installer edits for Omarchy Mac keybindings."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import secrets
+import stat
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+
+
+class SafetyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Fingerprint:
+    existed: bool
+    mode: int = 0
+    uid: int = -1
+    gid: int = -1
+    dev: int = -1
+    ino: int = -1
+    size: int = -1
+    mtime_ns: int = -1
+    sha256: str = ""
+
+
+@dataclass
+class Change:
+    path: str
+    before: dict
+    after: dict | None
+    backup: str | None
+    desired_mode: int
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def home_path() -> Path:
+    raw_home = os.environ.get("HOME")
+    if not raw_home or not os.path.isabs(raw_home):
+        raise SafetyError("HOME must be an absolute path")
+    home = Path(raw_home).resolve(strict=True)
+    st = os.lstat(home)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise SafetyError("HOME must be a real directory owned by the current user")
+    return home
+
+
+def require_under_home(path: Path) -> None:
+    home = home_path()
+    absolute = path.resolve(strict=False)
+    try:
+        absolute.relative_to(home)
+    except ValueError as exc:
+        raise SafetyError(f"Refusing path outside HOME: {path}") from exc
+
+
+def secure_directory(path: Path, *, create: bool = False, mode: int = 0o700) -> None:
+    require_under_home(path)
+    home = home_path()
+    current = home
+    for part in path.resolve(strict=False).relative_to(home).parts:
+        current /= part
+        if not current.exists():
+            if not create:
+                raise SafetyError(f"Required directory does not exist: {current}")
+            os.mkdir(current, mode)
+        st = os.lstat(current)
+        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            raise SafetyError(f"Directory path is not a real directory: {current}")
+        if st.st_uid != os.getuid():
+            raise SafetyError(f"Directory is not owned by the current user: {current}")
+        if st.st_mode & 0o022:
+            raise SafetyError(f"Directory is group/world writable: {current}")
+
+
+def read_regular(path: Path, *, optional: bool = False) -> tuple[bytes | None, Fingerprint]:
+    require_under_home(path)
+    secure_directory(path.parent)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        if optional:
+            return None, Fingerprint(False)
+        raise SafetyError(f"Required file does not exist: {path}")
+    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        raise SafetyError(f"Target is not a regular file: {path}")
+    if st.st_uid != os.getuid():
+        raise SafetyError(f"Target is not owned by the current user: {path}")
+    if st.st_nlink != 1:
+        raise SafetyError(f"Target has multiple hard links: {path}")
+    if st.st_mode & 0o022:
+        raise SafetyError(f"Target is group/world writable: {path}")
+    if st.st_size > MAX_CONFIG_BYTES:
+        raise SafetyError(f"Target exceeds {MAX_CONFIG_BYTES} bytes: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            raise SafetyError(f"Target changed while opening: {path}")
+        data = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_CONFIG_BYTES:
+                raise SafetyError(f"Target grew beyond limit: {path}")
+    finally:
+        os.close(fd)
+    return data, Fingerprint(
+        True,
+        stat.S_IMODE(st.st_mode),
+        st.st_uid,
+        st.st_gid,
+        st.st_dev,
+        st.st_ino,
+        st.st_size,
+        st.st_mtime_ns,
+        sha256(data),
+    )
+
+
+def current_fingerprint(path: Path) -> Fingerprint:
+    data, fp = read_regular(path, optional=True)
+    return fp if data is not None else Fingerprint(False)
+
+
+def same_fingerprint(left: Fingerprint, right: Fingerprint) -> bool:
+    return left == right
+
+
+def strip_exact_block(text: str, begin: str, end: str) -> str:
+    lines = text.splitlines(keepends=True)
+    begin_at = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == begin]
+    end_at = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == end]
+    if not begin_at and not end_at:
+        return text
+    if len(begin_at) != 1 or len(end_at) != 1 or begin_at[0] >= end_at[0]:
+        raise SafetyError(f"Malformed or duplicate managed markers: {begin!r} / {end!r}")
+    return "".join(lines[: begin_at[0]] + lines[end_at[0] + 1 :])
+
+
+def snippet(path: Path, begin: str, end: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    begins = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == begin]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == end]
+    if len(begins) != 1 or len(ends) != 1 or begins[0] >= ends[0]:
+        raise SafetyError(f"Bundled snippet has malformed markers: {path}")
+    return "".join(lines[begins[0] : ends[0] + 1]).rstrip() + "\n"
+
+
+def append_block(text: str, block: str) -> str:
+    return text.rstrip() + "\n\n" + block
+
+
+def transform_menu(text: str, install: bool) -> str:
+    begin = "  // BEGIN omarchy-mac-keybinding-menu"
+    end = "  // END omarchy-mac-keybinding-menu"
+    text = strip_exact_block(text, begin, end)
+    if not install:
+        return text
+    block = (
+        "  // BEGIN omarchy-mac-keybinding-menu\n"
+        "  // Display MacBook modifier names in Learn -> Keybindings.\n"
+        '  "learn.keybindings": {"icon":"","label":"Keybindings",'
+        '"action":"~/.local/bin/omarchy-menu-keybindings-mac"},\n'
+        "  // END omarchy-mac-keybinding-menu\n"
+    )
+    closing = text.rstrip().rfind("}")
+    if closing < 0 or text.rstrip()[closing + 1 :]:
+        raise SafetyError("Menu JSONC has no final top-level closing brace")
+    return text[:closing].rstrip() + "\n" + block + text[closing:]
+
+
+def transform_alias(text: str, install: bool) -> str:
+    begin = "# BEGIN omarchy-mac-keybinding-alias"
+    end = "# END omarchy-mac-keybinding-alias"
+    text = strip_exact_block(text, begin, end)
+    if not install:
+        return text
+    return append_block(
+        text,
+        begin
+        + '\nalias omarchy-menu-keybindings="$HOME/.local/bin/omarchy-menu-keybindings-mac"\n'
+        + end
+        + "\n",
+    )
+
+
+def verify_expected(path: Path, expected: Fingerprint) -> None:
+    actual = current_fingerprint(path)
+    if not same_fingerprint(actual, expected):
+        raise SafetyError(f"Concurrent change detected; refusing to replace {path}")
+
+
+def fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_replace(path: Path, data: bytes | None, mode: int, expected: Fingerprint) -> Fingerprint:
+    secure_directory(path.parent)
+    dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    temp_name = f".{path.name}.omarchy-mac.{secrets.token_hex(12)}.tmp"
+    try:
+        verify_expected(path, expected)
+        if data is None:
+            if expected.existed:
+                os.unlink(path.name, dir_fd=dirfd)
+                os.fsync(dirfd)
+            return Fingerprint(False)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temp_name, flags, mode, dir_fd=dirfd)
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        verify_expected(path, expected)
+        os.replace(temp_name, path.name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+        return current_fingerprint(path)
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=dirfd)
+        except FileNotFoundError:
+            pass
+        os.close(dirfd)
+
+
+def write_backup(tx_dir: Path, name: str, data: bytes, mode: int) -> str:
+    backup = tx_dir / name
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        os.fchmod(fd, mode)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return name
+
+
+def acquire_lock(state_dir: Path):
+    secure_directory(state_dir, create=True)
+    lock_path = state_dir / "transaction.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        os.close(fd)
+        raise SafetyError(f"Unsafe transaction lock: {lock_path}")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def state_directory() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", home_path() / ".local/state"))
+    return base / "omarchy-mac-keybinding"
+
+
+def build_operations(repo_dir: Path, install: bool):
+    home = home_path()
+    paths = {
+        "bindings": home / ".config/hypr/bindings.lua",
+        "input": home / ".config/hypr/input.lua",
+        "menu": home / ".config/omarchy/extensions/omarchy-menu.jsonc",
+        "bashrc": home / ".bashrc",
+        "binary": home / ".local/bin/omarchy-menu-keybindings-mac",
+    }
+    if install:
+        secure_directory(paths["binary"].parent, create=True)
+    operations = []
+    for key in ("bindings", "input", "menu"):
+        data, before = read_regular(paths[key])
+        assert data is not None
+        text = data.decode("utf-8")
+        if key in ("bindings", "input"):
+            begin = "-- BEGIN omarchy-mac-keybinding"
+            end = "-- END omarchy-mac-keybinding"
+            cleaned = strip_exact_block(text, begin, end)
+            desired = append_block(cleaned, snippet(repo_dir / "config" / f"{key}.lua", begin, end)) if install else cleaned
+        else:
+            desired = transform_menu(text, install)
+        operations.append((paths[key], before, desired.encode("utf-8"), before.mode))
+
+    bash_data, bash_before = read_regular(paths["bashrc"], optional=True)
+    if bash_data is not None:
+        desired = transform_alias(bash_data.decode("utf-8"), install).encode("utf-8")
+        operations.append((paths["bashrc"], bash_before, desired, bash_before.mode))
+
+    binary_data, binary_before = read_regular(paths["binary"], optional=True)
+    if install:
+        source = repo_dir / "bin/omarchy-menu-keybindings-mac"
+        source_data = source.read_bytes()
+        operations.append((paths["binary"], binary_before, source_data, 0o755))
+    elif binary_data is not None:
+        operations.append((paths["binary"], binary_before, None, binary_before.mode))
+    return operations
+
+
+def apply(repo_dir: Path, install: bool) -> Path:
+    state_dir = state_directory()
+    lock_fd = acquire_lock(state_dir)
+    tx_root = state_dir / "transactions"
+    secure_directory(tx_root, create=True)
+    tx_dir = tx_root / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(4)}"
+    os.mkdir(tx_dir, 0o700)
+    changes: list[Change] = []
+    try:
+        operations = build_operations(repo_dir, install)
+        for index, (path, before, desired, mode) in enumerate(operations):
+            original, verify_before = read_regular(path, optional=True)
+            if not same_fingerprint(before, verify_before):
+                raise SafetyError(f"Concurrent change detected before backup: {path}")
+            backup = None
+            if original is not None:
+                backup = write_backup(tx_dir, f"{index:02d}-{path.name}.original", original, before.mode)
+            change = Change(str(path), asdict(before), None, backup, mode)
+            changes.append(change)
+            after = atomic_replace(path, desired, mode, before)
+            change.after = asdict(after)
+        journal = tx_dir / "journal.json"
+        payload = {"version": 1, "operation": "install" if install else "uninstall", "changes": [asdict(c) for c in changes]}
+        journal.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.chmod(journal, 0o600)
+        with journal.open("rb") as handle:
+            os.fsync(handle.fileno())
+        fsync_directory(tx_dir)
+        print(tx_dir)
+        return tx_dir
+    except Exception:
+        rollback_changes(tx_dir, changes, require_after=False)
+        raise
+    finally:
+        os.close(lock_fd)
+
+
+def fp_from_dict(value: dict) -> Fingerprint:
+    return Fingerprint(**value)
+
+
+def rollback_changes(tx_dir: Path, changes: list[Change], *, require_after: bool = True) -> None:
+    for change in reversed(changes):
+        path = Path(change.path)
+        before = fp_from_dict(change.before)
+        after = fp_from_dict(change.after) if change.after else current_fingerprint(path)
+        if require_after and not same_fingerprint(current_fingerprint(path), after):
+            raise SafetyError(f"Refusing rollback because target changed after transaction: {path}")
+        if before.existed:
+            if not change.backup:
+                raise SafetyError(f"Missing rollback backup for {path}")
+            data = (tx_dir / change.backup).read_bytes()
+            atomic_replace(path, data, before.mode, current_fingerprint(path))
+        else:
+            atomic_replace(path, None, change.desired_mode, current_fingerprint(path))
+
+
+def rollback(tx_dir: Path) -> None:
+    state_dir = state_directory()
+    lock_fd = acquire_lock(state_dir)
+    try:
+        secure_directory(tx_dir)
+        expected_root = (state_dir / "transactions").resolve(strict=False)
+        try:
+            tx_dir.resolve(strict=False).relative_to(expected_root)
+        except ValueError as exc:
+            raise SafetyError("Transaction is outside the managed transaction directory") from exc
+        journal = tx_dir / "journal.json"
+        st = os.lstat(journal)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise SafetyError("Unsafe transaction journal")
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        changes = [Change(**item) for item in payload["changes"]]
+        rollback_changes(tx_dir, changes)
+        marker = tx_dir / "ROLLED_BACK"
+        marker.write_text(f"{time.time_ns()}\n", encoding="ascii")
+        os.chmod(marker, 0o600)
+        fsync_directory(tx_dir)
+    finally:
+        os.close(lock_fd)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("install", "uninstall"):
+        command = sub.add_parser(name)
+        command.add_argument("--repo-dir", required=True, type=Path)
+    command = sub.add_parser("rollback")
+    command.add_argument("transaction", type=Path)
+    args = parser.parse_args()
+    try:
+        if args.command == "rollback":
+            rollback(args.transaction)
+        else:
+            repo_dir = args.repo_dir.resolve(strict=True)
+            apply(repo_dir, args.command == "install")
+        return 0
+    except (OSError, UnicodeError, ValueError, SafetyError) as exc:
+        print(f"omarchy-mac-keybinding: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

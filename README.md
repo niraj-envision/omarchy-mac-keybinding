@@ -52,9 +52,14 @@ The installer:
 4. Adds a Bash alias for the Mac-labelled terminal command
 5. Reloads and validates Hyprland
 
-Existing files are backed up to `~/.local/state/omarchy-mac-keybinding/backups/`
-before they are changed. Running the installer again updates the marked blocks
-without duplicating them.
+Configuration changes are performed as one locked transaction. The installer
+verifies parent directories and target ownership/type/mode, rejects malformed
+or duplicate markers, preserves file modes, writes and fsyncs exclusive
+same-directory temporary files, detects concurrent changes, and atomically
+replaces each target. Originals and the transaction journal are retained under
+`~/.local/state/omarchy-mac-keybinding/transactions/`. If any write or the
+Hyprland validation fails, every completed change is automatically rolled back.
+Running the installer again updates the exact managed blocks without duplicates.
 
 ## Usage
 
@@ -86,8 +91,9 @@ hyprctl configerrors
 ./uninstall.sh
 ```
 
-This removes only the blocks and files managed by this project, preserving
-other personal Omarchy settings.
+Removal uses the same locked transaction and rollback guarantees. It removes
+only exact, structurally valid managed blocks and the installed wrapper while
+preserving other personal Omarchy settings.
 
 ## Notes
 

@@ -14,8 +14,8 @@ BarWidget {
 
   property bool installed: false
 
-  readonly property string pluginDir: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/io.github.niraj-envision.mac-keybindings"
+  readonly property string installPath: Qt.resolvedUrl("install.sh").toString().replace(/^file:\/\//, "")
+  readonly property string installedPath: Quickshell.env("HOME") + "/.local/bin/omarchy-menu-keybindings-mac"
   readonly property string icon: ""
   readonly property string tooltip: installed
     ? "Open Mac-labelled keybindings"
@@ -35,20 +35,34 @@ BarWidget {
   }
 
   function install() {
-    if (!root.bar) return
-    root.bar.run("omarchy-launch-floating-terminal-with-presentation "
-      + "bash -c '" + root.pluginDir + "/install.sh; read -n 1 -s'")
+    if (!installerProc.running) installerProc.running = true
   }
 
   Process {
     id: statusProbe
-    command: ["sh", "-c",
-      "command -v omarchy-menu-keybindings-mac >/dev/null 2>&1 && printf ready || printf setup"]
+    command: ["/usr/bin/test", "-x", root.installedPath]
     running: true
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.installed = String(text || "").trim() === "ready"
+    onExited: function(exitCode, exitStatus) { root.installed = exitCode === 0 }
+  }
+
+  Timer {
+    interval: 2000
+    repeat: false
+    running: statusProbe.running
+    onTriggered: {
+      statusProbe.running = false
+      root.installed = false
     }
+  }
+
+  Process {
+    id: installerProc
+    command: [
+      "/usr/bin/setsid", "uwsm-app", "--", "xdg-terminal-exec",
+      "--app-id=org.omarchy.terminal", "--title=Mac Keybindings Setup",
+      "-e", "/bin/bash", root.installPath
+    ]
+    onExited: function(exitCode, exitStatus) { root.refresh() }
   }
 
   IpcHandler {
