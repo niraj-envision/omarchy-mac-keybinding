@@ -1,12 +1,20 @@
+import importlib.util
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 HELPER = REPO / "scripts/config_transaction.py"
+SPEC = importlib.util.spec_from_file_location("config_transaction", HELPER)
+transaction = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+sys.modules[SPEC.name] = transaction
+SPEC.loader.exec_module(transaction)
 
 
 class ConfigTransactionTests(unittest.TestCase):
@@ -63,6 +71,44 @@ class ConfigTransactionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(bindings.read_text(encoding="utf-8"), malformed)
         self.assertEqual((self.home / ".config/hypr/input.lua").read_text(), self.originals[self.home / ".config/hypr/input.lua"])
+
+    def test_ancestor_swap_cannot_redirect_atomic_replace(self):
+        target = self.home / ".config/hypr/bindings.lua"
+        outside = self.home / "outside"
+        outside.mkdir()
+        decoy = outside / "bindings.lua"
+        decoy.write_text("do not touch\n", encoding="utf-8")
+        decoy.chmod(0o600)
+
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            _data, before = transaction.read_regular(target)
+            real_open_directory = transaction.open_directory_fd
+            swapped = False
+
+            def open_then_swap(path, **kwargs):
+                nonlocal swapped
+                fd = real_open_directory(path, **kwargs)
+                if path == target.parent and not swapped:
+                    swapped = True
+                    target.parent.rename(self.home / ".config/hypr-original")
+                    target.parent.symlink_to(outside, target_is_directory=True)
+                return fd
+
+            with mock.patch.object(transaction, "open_directory_fd", side_effect=open_then_swap):
+                transaction.atomic_replace(target, b"anchored\n", 0o600, before)
+
+        self.assertEqual(decoy.read_text(encoding="utf-8"), "do not touch\n")
+        self.assertEqual(
+            (self.home / ".config/hypr-original/bindings.lua").read_text(encoding="utf-8"),
+            "anchored\n",
+        )
+
+    def test_widget_executes_only_absolute_paths(self):
+        widget = (REPO / "BarWidget.qml").read_text(encoding="utf-8")
+        self.assertNotIn('bar.run("omarchy-menu-keybindings-mac")', widget)
+        self.assertIn("command: [root.installedPath]", widget)
+        self.assertIn('"/usr/bin/uwsm-app"', widget)
+        self.assertIn('"/usr/bin/xdg-terminal-exec"', widget)
 
 
 if __name__ == "__main__":

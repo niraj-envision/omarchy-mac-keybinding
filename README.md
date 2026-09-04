@@ -3,6 +3,8 @@
 MacBook-friendly keyboard labels, editing shortcuts, and trackpad gestures for
 [Omarchy](https://omarchy.org/) on Hyprland 0.55 or newer.
 
+![Mac Keybindings preview](preview.png)
+
 This project does **not** remap the physical keyboard. On Linux, the Mac
 Command key is reported to Hyprland as `SUPER`, Option as `ALT`, and Control as
 `CTRL`. The configuration keeps those real modifier names internally and only

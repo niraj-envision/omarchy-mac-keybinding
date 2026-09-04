@@ -29,8 +29,9 @@ BarWidget {
   }
 
   function open() {
-    if (!root.bar) return
-    if (installed) root.bar.run("omarchy-menu-keybindings-mac")
+    if (installed) {
+      if (!menuProc.running) menuProc.running = true
+    }
     else root.install()
   }
 
@@ -56,9 +57,14 @@ BarWidget {
   }
 
   Process {
+    id: menuProc
+    command: [root.installedPath]
+  }
+
+  Process {
     id: installerProc
     command: [
-      "/usr/bin/setsid", "uwsm-app", "--", "xdg-terminal-exec",
+      "/usr/bin/setsid", "/usr/bin/uwsm-app", "--", "/usr/bin/xdg-terminal-exec",
       "--app-id=org.omarchy.terminal", "--title=Mac Keybindings Setup",
       "-e", "/bin/bash", root.installPath
     ]

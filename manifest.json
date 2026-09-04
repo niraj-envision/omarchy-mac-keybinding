@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.niraj-envision.mac-keybindings",
   "name": "Mac Keybindings",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "niraj-envision",
   "license": "MIT",
   "description": "MacBook-friendly Omarchy keybindings, modifier labels, and trackpad gestures with a bar launcher.",

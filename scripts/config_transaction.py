@@ -52,7 +52,7 @@ def home_path() -> Path:
     raw_home = os.environ.get("HOME")
     if not raw_home or not os.path.isabs(raw_home):
         raise SafetyError("HOME must be an absolute path")
-    home = Path(raw_home).resolve(strict=True)
+    home = Path(os.path.abspath(raw_home))
     st = os.lstat(home)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
         raise SafetyError("HOME must be a real directory owned by the current user")
@@ -61,57 +61,91 @@ def home_path() -> Path:
 
 def require_under_home(path: Path) -> None:
     home = home_path()
-    absolute = path.resolve(strict=False)
+    absolute = Path(os.path.abspath(path))
     try:
         absolute.relative_to(home)
     except ValueError as exc:
         raise SafetyError(f"Refusing path outside HOME: {path}") from exc
 
 
-def secure_directory(path: Path, *, create: bool = False, mode: int = 0o700) -> None:
+def open_directory_fd(path: Path, *, create: bool = False, mode: int = 0o700) -> int:
+    """Open a HOME-relative directory without ever re-resolving an ancestor.
+
+    Every component is opened relative to the already verified parent file
+    descriptor.  A rename or symlink swap can therefore only make the open
+    fail; it cannot redirect the transaction outside the anchored tree.
+    """
     require_under_home(path)
     home = home_path()
-    current = home
-    for part in path.resolve(strict=False).relative_to(home).parts:
-        current /= part
-        if not current.exists():
-            if not create:
-                raise SafetyError(f"Required directory does not exist: {current}")
-            os.mkdir(current, mode)
-        st = os.lstat(current)
-        if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
-            raise SafetyError(f"Directory path is not a real directory: {current}")
-        if st.st_uid != os.getuid():
-            raise SafetyError(f"Directory is not owned by the current user: {current}")
-        if st.st_mode & 0o022:
-            raise SafetyError(f"Directory is group/world writable: {current}")
-
-
-def read_regular(path: Path, *, optional: bool = False) -> tuple[bytes | None, Fingerprint]:
-    require_under_home(path)
-    secure_directory(path.parent)
+    absolute = Path(os.path.abspath(path))
+    parts = absolute.relative_to(home).parts
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    expected = os.lstat(home)
+    fd = os.open(home, flags)
     try:
-        st = os.lstat(path)
+        opened_home = os.fstat(fd)
+        if (opened_home.st_dev, opened_home.st_ino) != (expected.st_dev, expected.st_ino):
+            raise SafetyError("HOME changed while opening")
+        if opened_home.st_uid != os.getuid() or opened_home.st_mode & 0o022:
+            raise SafetyError("HOME must be owned by the current user and not group/world writable")
+        current = home
+        for part in parts:
+            current /= part
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise SafetyError(f"Required directory does not exist: {current}") from None
+                try:
+                    os.mkdir(part, mode, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=fd)
+            st = os.fstat(child)
+            if not stat.S_ISDIR(st.st_mode):
+                os.close(child)
+                raise SafetyError(f"Directory path is not a real directory: {current}")
+            if st.st_uid != os.getuid():
+                os.close(child)
+                raise SafetyError(f"Directory is not owned by the current user: {current}")
+            if st.st_mode & 0o022:
+                os.close(child)
+                raise SafetyError(f"Directory is group/world writable: {current}")
+            os.close(fd)
+            fd = child
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def secure_directory(path: Path, *, create: bool = False, mode: int = 0o700) -> None:
+    fd = open_directory_fd(path, create=create, mode=mode)
+    os.close(fd)
+
+
+def read_regular_at(
+    dirfd: int, name: str, display_path: Path, *, optional: bool = False
+) -> tuple[bytes | None, Fingerprint]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dirfd)
     except FileNotFoundError:
         if optional:
             return None, Fingerprint(False)
-        raise SafetyError(f"Required file does not exist: {path}")
-    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        raise SafetyError(f"Target is not a regular file: {path}")
-    if st.st_uid != os.getuid():
-        raise SafetyError(f"Target is not owned by the current user: {path}")
-    if st.st_nlink != 1:
-        raise SafetyError(f"Target has multiple hard links: {path}")
-    if st.st_mode & 0o022:
-        raise SafetyError(f"Target is group/world writable: {path}")
-    if st.st_size > MAX_CONFIG_BYTES:
-        raise SafetyError(f"Target exceeds {MAX_CONFIG_BYTES} bytes: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+        raise SafetyError(f"Required file does not exist: {display_path}") from None
     try:
-        opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-            raise SafetyError(f"Target changed while opening: {path}")
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SafetyError(f"Target is not a regular file: {display_path}")
+        if st.st_uid != os.getuid():
+            raise SafetyError(f"Target is not owned by the current user: {display_path}")
+        if st.st_nlink != 1:
+            raise SafetyError(f"Target has multiple hard links: {display_path}")
+        if st.st_mode & 0o022:
+            raise SafetyError(f"Target is group/world writable: {display_path}")
+        if st.st_size > MAX_CONFIG_BYTES:
+            raise SafetyError(f"Target exceeds {MAX_CONFIG_BYTES} bytes: {display_path}")
         data = b""
         while True:
             chunk = os.read(fd, 65536)
@@ -119,7 +153,7 @@ def read_regular(path: Path, *, optional: bool = False) -> tuple[bytes | None, F
                 break
             data += chunk
             if len(data) > MAX_CONFIG_BYTES:
-                raise SafetyError(f"Target grew beyond limit: {path}")
+                raise SafetyError(f"Target grew beyond limit: {display_path}")
     finally:
         os.close(fd)
     return data, Fingerprint(
@@ -133,6 +167,15 @@ def read_regular(path: Path, *, optional: bool = False) -> tuple[bytes | None, F
         st.st_mtime_ns,
         sha256(data),
     )
+
+
+def read_regular(path: Path, *, optional: bool = False) -> tuple[bytes | None, Fingerprint]:
+    require_under_home(path)
+    dirfd = open_directory_fd(path.parent)
+    try:
+        return read_regular_at(dirfd, path.name, path, optional=optional)
+    finally:
+        os.close(dirfd)
 
 
 def current_fingerprint(path: Path) -> Fingerprint:
@@ -203,14 +246,19 @@ def transform_alias(text: str, install: bool) -> str:
     )
 
 
-def verify_expected(path: Path, expected: Fingerprint) -> None:
-    actual = current_fingerprint(path)
+def current_fingerprint_at(dirfd: int, name: str, display_path: Path) -> Fingerprint:
+    data, fp = read_regular_at(dirfd, name, display_path, optional=True)
+    return fp if data is not None else Fingerprint(False)
+
+
+def verify_expected_at(dirfd: int, name: str, display_path: Path, expected: Fingerprint) -> None:
+    actual = current_fingerprint_at(dirfd, name, display_path)
     if not same_fingerprint(actual, expected):
-        raise SafetyError(f"Concurrent change detected; refusing to replace {path}")
+        raise SafetyError(f"Concurrent change detected; refusing to replace {display_path}")
 
 
 def fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = open_directory_fd(path)
     try:
         os.fsync(fd)
     finally:
@@ -218,11 +266,11 @@ def fsync_directory(path: Path) -> None:
 
 
 def atomic_replace(path: Path, data: bytes | None, mode: int, expected: Fingerprint) -> Fingerprint:
-    secure_directory(path.parent)
-    dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    require_under_home(path)
+    dirfd = open_directory_fd(path.parent)
     temp_name = f".{path.name}.omarchy-mac.{secrets.token_hex(12)}.tmp"
     try:
-        verify_expected(path, expected)
+        verify_expected_at(dirfd, path.name, path, expected)
         if data is None:
             if expected.existed:
                 os.unlink(path.name, dir_fd=dirfd)
@@ -239,10 +287,10 @@ def atomic_replace(path: Path, data: bytes | None, mode: int, expected: Fingerpr
             os.fsync(fd)
         finally:
             os.close(fd)
-        verify_expected(path, expected)
+        verify_expected_at(dirfd, path.name, path, expected)
         os.replace(temp_name, path.name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
         os.fsync(dirfd)
-        return current_fingerprint(path)
+        return current_fingerprint_at(dirfd, path.name, path)
     finally:
         try:
             os.unlink(temp_name, dir_fd=dirfd)
@@ -252,8 +300,13 @@ def atomic_replace(path: Path, data: bytes | None, mode: int, expected: Fingerpr
 
 
 def write_backup(tx_dir: Path, name: str, data: bytes, mode: int) -> str:
-    backup = tx_dir / name
-    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    dirfd = open_directory_fd(tx_dir)
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        mode,
+        dir_fd=dirfd,
+    )
     try:
         os.fchmod(fd, mode)
         view = memoryview(data)
@@ -263,13 +316,22 @@ def write_backup(tx_dir: Path, name: str, data: bytes, mode: int) -> str:
         os.fsync(fd)
     finally:
         os.close(fd)
+        os.close(dirfd)
     return name
 
 
 def acquire_lock(state_dir: Path):
-    secure_directory(state_dir, create=True)
+    dirfd = open_directory_fd(state_dir, create=True)
     lock_path = state_dir / "transaction.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fd = os.open(
+            lock_path.name,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=dirfd,
+        )
+    finally:
+        os.close(dirfd)
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
         os.close(fd)
