@@ -130,7 +130,13 @@ def read_regular_at(
     dirfd: int, name: str, display_path: Path, *, optional: bool = False
 ) -> tuple[bytes | None, Fingerprint]:
     require_entry_name(name)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NOFOLLOW blocks symlink substitution; O_NONBLOCK ensures a planted
+    # FIFO or device cannot hang us before fstat can reject its type.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(name, flags, dir_fd=dirfd)
     except FileNotFoundError:
@@ -401,7 +407,10 @@ def acquire_lock(state_dir: Path):
     try:
         fd = os.open(
             lock_path.name,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
             0o600,
             dir_fd=dirfd,
         )

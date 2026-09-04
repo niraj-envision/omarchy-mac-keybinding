@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ class ConfigTransactionTests(unittest.TestCase):
             text=True,
             capture_output=True,
             check=check,
+            timeout=5,
         )
 
     def test_install_and_rollback_restore_every_file(self):
@@ -127,6 +129,17 @@ module.apply(Path(repo), True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(bindings.read_text(encoding="utf-8"), malformed)
         self.assertEqual((self.home / ".config/hypr/input.lua").read_text(), self.originals[self.home / ".config/hypr/input.lua"])
+
+    def test_planted_fifo_target_fails_closed_without_blocking(self):
+        bindings = self.home / ".config/hypr/bindings.lua"
+        bindings.unlink()
+        os.mkfifo(bindings, 0o600)
+        result = self.run_helper(
+            "install", "--repo-dir", str(REPO), check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a regular file", result.stderr)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(bindings).st_mode))
 
     def test_ancestor_swap_cannot_redirect_atomic_replace(self):
         target = self.home / ".config/hypr/bindings.lua"
