@@ -42,6 +42,8 @@ class Change:
     after: dict | None
     backup: str | None
     desired_mode: int
+    planned: dict | None = None
+    status: str = "applied"
 
 
 def sha256(data: bytes) -> str:
@@ -188,6 +190,42 @@ def same_fingerprint(left: Fingerprint, right: Fingerprint) -> bool:
     return left == right
 
 
+def planned_state(data: bytes | None, mode: int) -> dict:
+    if data is None:
+        return {"existed": False, "mode": 0, "size": -1, "sha256": ""}
+    return {
+        "existed": True,
+        "mode": mode,
+        "size": len(data),
+        "sha256": sha256(data),
+    }
+
+
+def matches_planned(actual: Fingerprint, planned: dict | None) -> bool:
+    if not planned or actual.existed != bool(planned.get("existed")):
+        return False
+    if not actual.existed:
+        return True
+    return (
+        actual.mode == int(planned.get("mode", -1))
+        and actual.size == int(planned.get("size", -1))
+        and actual.sha256 == str(planned.get("sha256", ""))
+    )
+
+
+def matches_restored(actual: Fingerprint, before: Fingerprint) -> bool:
+    if actual.existed != before.existed:
+        return False
+    if not actual.existed:
+        return True
+    return (
+        actual.mode == before.mode
+        and actual.uid == before.uid
+        and actual.size == before.size
+        and actual.sha256 == before.sha256
+    )
+
+
 def require_entry_name(name: str) -> None:
     if not name or name in (".", "..") or os.path.basename(name) != name:
         raise SafetyError(f"Unsafe directory entry name: {name!r}")
@@ -324,6 +362,34 @@ def write_new_regular_at(dirfd: int, name: str, data: bytes, mode: int) -> None:
         os.close(fd)
 
 
+def checkpoint_journal(
+    tx_dirfd: int, operation: str, state: str, changes: list[Change]
+) -> None:
+    """Atomically persist and fsync the complete transaction state."""
+    payload = {
+        "version": 2,
+        "operation": operation,
+        "state": state,
+        "changes": [asdict(change) for change in changes],
+    }
+    data = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+    temp_name = f".journal.{secrets.token_hex(12)}.tmp"
+    try:
+        write_new_regular_at(tx_dirfd, temp_name, data, 0o600)
+        os.replace(
+            temp_name,
+            "journal.json",
+            src_dir_fd=tx_dirfd,
+            dst_dir_fd=tx_dirfd,
+        )
+        os.fsync(tx_dirfd)
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=tx_dirfd)
+        except FileNotFoundError:
+            pass
+
+
 def write_backup(tx_dirfd: int, name: str, data: bytes, mode: int) -> str:
     write_new_regular_at(tx_dirfd, name, data, mode)
     return name
@@ -395,6 +461,7 @@ def build_operations(repo_dir: Path, install: bool):
 
 
 def apply(repo_dir: Path, install: bool) -> Path:
+    operation = "install" if install else "uninstall"
     state_dir = state_directory()
     lock_fd = acquire_lock(state_dir)
     tx_root = state_dir / "transactions"
@@ -408,8 +475,12 @@ def apply(repo_dir: Path, install: bool) -> Path:
     tx_dir = tx_root / tx_name
     tx_dirfd = open_directory_fd(tx_dir)
     changes: list[Change] = []
+    journal_ready = False
     try:
         operations = build_operations(repo_dir, install)
+        # Stage and fsync every backup before the first target mutation.  The
+        # resulting write-ahead journal is sufficient to recover even if this
+        # process and its parent shell are killed in the next instruction.
         for index, (path, before, desired, mode) in enumerate(operations):
             original, verify_before = read_regular(path, optional=True)
             if not same_fingerprint(before, verify_before):
@@ -419,22 +490,38 @@ def apply(repo_dir: Path, install: bool) -> Path:
                 backup = write_backup(
                     tx_dirfd, f"{index:02d}-{path.name}.original", original, before.mode
                 )
-            change = Change(str(path), asdict(before), None, backup, mode)
+            changes.append(
+                Change(
+                    str(path),
+                    asdict(before),
+                    None,
+                    backup,
+                    mode,
+                    planned_state(desired, mode),
+                    "prepared",
+                )
+            )
+        checkpoint_journal(tx_dirfd, operation, "prepared", changes)
+        journal_ready = True
+        print(tx_dir, flush=True)
+
+        for change, (path, before, desired, mode) in zip(changes, operations):
+            change.status = "applying"
+            checkpoint_journal(tx_dirfd, operation, "applying", changes)
             after = atomic_replace(path, desired, mode, before)
             change.after = asdict(after)
-            changes.append(change)
-        payload = {"version": 1, "operation": "install" if install else "uninstall", "changes": [asdict(c) for c in changes]}
-        write_new_regular_at(
-            tx_dirfd,
-            "journal.json",
-            (json.dumps(payload, indent=2) + "\n").encode("utf-8"),
-            0o600,
-        )
-        os.fsync(tx_dirfd)
-        print(tx_dir)
+            change.status = "applied"
+            checkpoint_journal(tx_dirfd, operation, "applying", changes)
+        checkpoint_journal(tx_dirfd, operation, "committed", changes)
         return tx_dir
-    except Exception:
-        rollback_changes(tx_dir, changes, tx_dirfd=tx_dirfd)
+    except BaseException:
+        if journal_ready:
+            rollback_changes(
+                tx_dir,
+                changes,
+                tx_dirfd=tx_dirfd,
+                operation=operation,
+            )
         raise
     finally:
         os.close(tx_dirfd)
@@ -446,7 +533,11 @@ def fp_from_dict(value: dict) -> Fingerprint:
 
 
 def rollback_changes(
-    tx_dir: Path, changes: list[Change], *, tx_dirfd: int | None = None
+    tx_dir: Path,
+    changes: list[Change],
+    *,
+    tx_dirfd: int | None = None,
+    operation: str = "unknown",
 ) -> None:
     own_fd = tx_dirfd is None
     if tx_dirfd is None:
@@ -455,14 +546,61 @@ def rollback_changes(
         for change in reversed(changes):
             path = Path(change.path)
             before = fp_from_dict(change.before)
-            if change.after is None:
-                raise SafetyError(f"Missing post-change fingerprint for rollback target: {path}")
-            after = fp_from_dict(change.after)
             actual = current_fingerprint(path)
-            if not same_fingerprint(actual, after):
+
+            if change.status == "rolled-back":
+                if not matches_restored(actual, before):
+                    raise SafetyError(
+                        f"Rolled-back target changed after recovery: {path}"
+                    )
+                continue
+            if change.status == "prepared":
+                if not same_fingerprint(actual, before):
+                    raise SafetyError(
+                        f"Unstarted target changed during transaction: {path}"
+                    )
+                change.status = "rolled-back"
+                checkpoint_journal(tx_dirfd, operation, "rolling-back", changes)
+                continue
+            if change.status == "applying":
+                if same_fingerprint(actual, before):
+                    change.status = "rolled-back"
+                    checkpoint_journal(tx_dirfd, operation, "rolling-back", changes)
+                    continue
+                if not matches_planned(actual, change.planned):
+                    raise SafetyError(
+                        f"In-flight target has an unrecognized concurrent change: {path}"
+                    )
+            elif change.status == "rolling-back":
+                if matches_restored(actual, before):
+                    change.status = "rolled-back"
+                    checkpoint_journal(tx_dirfd, operation, "rolling-back", changes)
+                    continue
+                if change.after is not None:
+                    after = fp_from_dict(change.after)
+                    if not same_fingerprint(actual, after):
+                        raise SafetyError(
+                            f"Rollback target changed during recovery: {path}"
+                        )
+                elif not matches_planned(actual, change.planned):
+                    raise SafetyError(
+                        f"Rollback target has an unrecognized state: {path}"
+                    )
+            elif change.status == "applied":
+                if change.after is None:
+                    raise SafetyError(f"Missing post-change fingerprint: {path}")
+                after = fp_from_dict(change.after)
+                if not same_fingerprint(actual, after):
+                    raise SafetyError(
+                        f"Refusing rollback because target changed after transaction: {path}"
+                    )
+            else:
                 raise SafetyError(
-                    f"Refusing rollback because target changed after transaction: {path}"
+                    f"Unknown transaction status {change.status!r} for {path}"
                 )
+
+            change.status = "rolling-back"
+            checkpoint_journal(tx_dirfd, operation, "rolling-back", changes)
             if before.existed:
                 if not change.backup:
                     raise SafetyError(f"Missing rollback backup for {path}")
@@ -473,6 +611,10 @@ def rollback_changes(
                 atomic_replace(path, data, before.mode, actual)
             else:
                 atomic_replace(path, None, change.desired_mode, actual)
+            change.status = "rolled-back"
+            checkpoint_journal(tx_dirfd, operation, "rolling-back", changes)
+
+        checkpoint_journal(tx_dirfd, operation, "rolled-back", changes)
     finally:
         if own_fd:
             os.close(tx_dirfd)
@@ -493,8 +635,18 @@ def rollback(tx_dir: Path) -> None:
             )
             assert journal_data is not None
             payload = json.loads(journal_data.decode("utf-8"))
+            if payload.get("version") not in (1, 2):
+                raise SafetyError("Unsupported transaction journal version")
+            if payload.get("state") == "rolled-back":
+                return
+            operation = str(payload.get("operation") or "unknown")
             changes = [Change(**item) for item in payload["changes"]]
-            rollback_changes(tx_dir, changes, tx_dirfd=tx_dirfd)
+            rollback_changes(
+                tx_dir,
+                changes,
+                tx_dirfd=tx_dirfd,
+                operation=operation,
+            )
             write_new_regular_at(
                 tx_dirfd, "ROLLED_BACK", f"{time.time_ns()}\n".encode("ascii"), 0o600
             )

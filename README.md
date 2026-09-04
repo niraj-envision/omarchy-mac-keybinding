@@ -61,6 +61,10 @@ same-directory temporary files, detects concurrent changes, and atomically
 replaces each target. Originals and the transaction journal are retained under
 `~/.local/state/omarchy-mac-keybinding/transactions/`. If any write or the
 Hyprland validation fails, every completed change is automatically rolled back.
+All backups and a complete write-ahead journal are fsynced before the first
+target changes, and each in-flight or completed replacement is checkpointed
+atomically. A process or session kill therefore leaves a complete recovery
+record without permitting rollback to overwrite a later concurrent edit.
 Running the installer again updates the exact managed blocks without duplicates.
 
 ## Usage

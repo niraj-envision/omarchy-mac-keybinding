@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import pathlib
 import subprocess
@@ -61,6 +62,61 @@ class ConfigTransactionTests(unittest.TestCase):
         for path, content in self.originals.items():
             self.assertEqual(path.read_text(encoding="utf-8"), content)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.home / ".local/bin/omarchy-menu-keybindings-mac").exists())
+
+    def test_kill_after_first_replace_has_complete_recovery_journal(self):
+        harness = r'''
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+helper, repo = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("crash_transaction", helper)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+real_replace = module.atomic_replace
+
+def replace_then_die(*args, **kwargs):
+    real_replace(*args, **kwargs)
+    os._exit(91)
+
+module.atomic_replace = replace_then_die
+module.apply(Path(repo), True)
+'''
+        result = subprocess.run(
+            ["python3", "-c", harness, str(HELPER), str(REPO)],
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 91, result.stderr)
+        transaction_dir = pathlib.Path(result.stdout.strip())
+        journal = json.loads(
+            (transaction_dir / "journal.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(journal["version"], 2)
+        self.assertEqual(journal["state"], "applying")
+        self.assertEqual(journal["changes"][0]["status"], "applying")
+        self.assertTrue(all("planned" in change for change in journal["changes"]))
+        self.assertTrue(
+            all(
+                change["backup"] is None
+                or (transaction_dir / change["backup"]).is_file()
+                for change in journal["changes"]
+            )
+        )
+        self.assertIn(
+            "BEGIN omarchy-mac-keybinding",
+            (self.home / ".config/hypr/bindings.lua").read_text(encoding="utf-8"),
+        )
+
+        rollback = self.run_helper("rollback", str(transaction_dir), check=False)
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        for path, content in self.originals.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), content)
         self.assertFalse((self.home / ".local/bin/omarchy-menu-keybindings-mac").exists())
 
     def test_duplicate_markers_fail_closed(self):
