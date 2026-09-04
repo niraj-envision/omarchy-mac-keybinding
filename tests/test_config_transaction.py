@@ -110,6 +110,87 @@ class ConfigTransactionTests(unittest.TestCase):
         self.assertIn('"/usr/bin/uwsm-app"', widget)
         self.assertIn('"/usr/bin/xdg-terminal-exec"', widget)
 
+    def test_installers_use_only_fixed_tool_paths(self):
+        for name in ("install.sh", "uninstall.sh"):
+            script = (REPO / name).read_text(encoding="utf-8")
+            self.assertIn("python_bin=/usr/bin/python3", script)
+            self.assertIn("hyprctl_bin=/usr/bin/hyprctl", script)
+            self.assertIn("omarchy_bin=/usr/bin/omarchy", script)
+            self.assertNotIn("$(dirname", script)
+            self.assertNotRegex(script, r"(?m)^\s*(python3|hyprctl|omarchy)\b")
+
+    def test_rollback_refuses_to_overwrite_a_concurrent_edit(self):
+        target = self.home / ".config/hypr/bindings.lua"
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            transaction_dir = transaction.apply(REPO, True)
+            target.write_text("legitimate concurrent edit\n", encoding="utf-8")
+            target.chmod(0o600)
+            with self.assertRaises(transaction.SafetyError):
+                transaction.rollback(transaction_dir)
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), "legitimate concurrent edit\n"
+        )
+
+    def test_partial_failure_does_not_overwrite_a_concurrent_edit(self):
+        target = self.home / ".config/hypr/bindings.lua"
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            operations = transaction.build_operations(REPO, True)
+            real_atomic_replace = transaction.atomic_replace
+            calls = 0
+
+            def fail_second_replace(path, data, mode, expected):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    target.write_text("concurrent during failure\n", encoding="utf-8")
+                    target.chmod(0o600)
+                    raise transaction.SafetyError("simulated later write failure")
+                return real_atomic_replace(path, data, mode, expected)
+
+            with mock.patch.object(
+                transaction, "build_operations", return_value=operations
+            ), mock.patch.object(
+                transaction, "atomic_replace", side_effect=fail_second_replace
+            ):
+                with self.assertRaises(transaction.SafetyError):
+                    transaction.apply(REPO, True)
+
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), "concurrent during failure\n"
+        )
+
+    def test_rollback_keeps_journal_and_backups_on_anchored_directory(self):
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            transaction_dir = transaction.apply(REPO, True)
+            saved_dir = transaction_dir.with_name(transaction_dir.name + "-anchored")
+            decoy_dir = self.home / "decoy-transaction"
+            decoy_dir.mkdir(mode=0o700)
+            (decoy_dir / "journal.json").write_text(
+                '{"version": 1, "changes": []}\n', encoding="utf-8"
+            )
+            (decoy_dir / "journal.json").chmod(0o600)
+            real_open_directory = transaction.open_directory_fd
+            swapped = False
+
+            def open_then_swap(path, **kwargs):
+                nonlocal swapped
+                fd = real_open_directory(path, **kwargs)
+                if pathlib.Path(path) == transaction_dir and not swapped:
+                    swapped = True
+                    transaction_dir.rename(saved_dir)
+                    transaction_dir.symlink_to(decoy_dir, target_is_directory=True)
+                return fd
+
+            with mock.patch.object(
+                transaction, "open_directory_fd", side_effect=open_then_swap
+            ):
+                transaction.rollback(transaction_dir)
+
+        for path, content in self.originals.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), content)
+        self.assertTrue((saved_dir / "ROLLED_BACK").is_file())
+        self.assertFalse((decoy_dir / "ROLLED_BACK").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

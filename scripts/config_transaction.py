@@ -127,6 +127,7 @@ def secure_directory(path: Path, *, create: bool = False, mode: int = 0o700) -> 
 def read_regular_at(
     dirfd: int, name: str, display_path: Path, *, optional: bool = False
 ) -> tuple[bytes | None, Fingerprint]:
+    require_entry_name(name)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(name, flags, dir_fd=dirfd)
@@ -185,6 +186,11 @@ def current_fingerprint(path: Path) -> Fingerprint:
 
 def same_fingerprint(left: Fingerprint, right: Fingerprint) -> bool:
     return left == right
+
+
+def require_entry_name(name: str) -> None:
+    if not name or name in (".", "..") or os.path.basename(name) != name:
+        raise SafetyError(f"Unsafe directory entry name: {name!r}")
 
 
 def strip_exact_block(text: str, begin: str, end: str) -> str:
@@ -299,8 +305,8 @@ def atomic_replace(path: Path, data: bytes | None, mode: int, expected: Fingerpr
         os.close(dirfd)
 
 
-def write_backup(tx_dir: Path, name: str, data: bytes, mode: int) -> str:
-    dirfd = open_directory_fd(tx_dir)
+def write_new_regular_at(dirfd: int, name: str, data: bytes, mode: int) -> None:
+    require_entry_name(name)
     fd = os.open(
         name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -316,7 +322,10 @@ def write_backup(tx_dir: Path, name: str, data: bytes, mode: int) -> str:
         os.fsync(fd)
     finally:
         os.close(fd)
-        os.close(dirfd)
+
+
+def write_backup(tx_dirfd: int, name: str, data: bytes, mode: int) -> str:
+    write_new_regular_at(tx_dirfd, name, data, mode)
     return name
 
 
@@ -389,9 +398,15 @@ def apply(repo_dir: Path, install: bool) -> Path:
     state_dir = state_directory()
     lock_fd = acquire_lock(state_dir)
     tx_root = state_dir / "transactions"
-    secure_directory(tx_root, create=True)
-    tx_dir = tx_root / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(4)}"
-    os.mkdir(tx_dir, 0o700)
+    tx_root_fd = open_directory_fd(tx_root, create=True)
+    tx_name = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        os.mkdir(tx_name, 0o700, dir_fd=tx_root_fd)
+        os.fsync(tx_root_fd)
+    finally:
+        os.close(tx_root_fd)
+    tx_dir = tx_root / tx_name
+    tx_dirfd = open_directory_fd(tx_dir)
     changes: list[Change] = []
     try:
         operations = build_operations(repo_dir, install)
@@ -401,24 +416,28 @@ def apply(repo_dir: Path, install: bool) -> Path:
                 raise SafetyError(f"Concurrent change detected before backup: {path}")
             backup = None
             if original is not None:
-                backup = write_backup(tx_dir, f"{index:02d}-{path.name}.original", original, before.mode)
+                backup = write_backup(
+                    tx_dirfd, f"{index:02d}-{path.name}.original", original, before.mode
+                )
             change = Change(str(path), asdict(before), None, backup, mode)
-            changes.append(change)
             after = atomic_replace(path, desired, mode, before)
             change.after = asdict(after)
-        journal = tx_dir / "journal.json"
+            changes.append(change)
         payload = {"version": 1, "operation": "install" if install else "uninstall", "changes": [asdict(c) for c in changes]}
-        journal.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.chmod(journal, 0o600)
-        with journal.open("rb") as handle:
-            os.fsync(handle.fileno())
-        fsync_directory(tx_dir)
+        write_new_regular_at(
+            tx_dirfd,
+            "journal.json",
+            (json.dumps(payload, indent=2) + "\n").encode("utf-8"),
+            0o600,
+        )
+        os.fsync(tx_dirfd)
         print(tx_dir)
         return tx_dir
     except Exception:
-        rollback_changes(tx_dir, changes, require_after=False)
+        rollback_changes(tx_dir, changes, tx_dirfd=tx_dirfd)
         raise
     finally:
+        os.close(tx_dirfd)
         os.close(lock_fd)
 
 
@@ -426,43 +445,62 @@ def fp_from_dict(value: dict) -> Fingerprint:
     return Fingerprint(**value)
 
 
-def rollback_changes(tx_dir: Path, changes: list[Change], *, require_after: bool = True) -> None:
-    for change in reversed(changes):
-        path = Path(change.path)
-        before = fp_from_dict(change.before)
-        after = fp_from_dict(change.after) if change.after else current_fingerprint(path)
-        if require_after and not same_fingerprint(current_fingerprint(path), after):
-            raise SafetyError(f"Refusing rollback because target changed after transaction: {path}")
-        if before.existed:
-            if not change.backup:
-                raise SafetyError(f"Missing rollback backup for {path}")
-            data = (tx_dir / change.backup).read_bytes()
-            atomic_replace(path, data, before.mode, current_fingerprint(path))
-        else:
-            atomic_replace(path, None, change.desired_mode, current_fingerprint(path))
+def rollback_changes(
+    tx_dir: Path, changes: list[Change], *, tx_dirfd: int | None = None
+) -> None:
+    own_fd = tx_dirfd is None
+    if tx_dirfd is None:
+        tx_dirfd = open_directory_fd(tx_dir)
+    try:
+        for change in reversed(changes):
+            path = Path(change.path)
+            before = fp_from_dict(change.before)
+            if change.after is None:
+                raise SafetyError(f"Missing post-change fingerprint for rollback target: {path}")
+            after = fp_from_dict(change.after)
+            actual = current_fingerprint(path)
+            if not same_fingerprint(actual, after):
+                raise SafetyError(
+                    f"Refusing rollback because target changed after transaction: {path}"
+                )
+            if before.existed:
+                if not change.backup:
+                    raise SafetyError(f"Missing rollback backup for {path}")
+                data, _backup_fp = read_regular_at(
+                    tx_dirfd, change.backup, tx_dir / change.backup
+                )
+                assert data is not None
+                atomic_replace(path, data, before.mode, actual)
+            else:
+                atomic_replace(path, None, change.desired_mode, actual)
+    finally:
+        if own_fd:
+            os.close(tx_dirfd)
 
 
 def rollback(tx_dir: Path) -> None:
     state_dir = state_directory()
     lock_fd = acquire_lock(state_dir)
     try:
-        secure_directory(tx_dir)
-        expected_root = (state_dir / "transactions").resolve(strict=False)
+        expected_root = Path(os.path.abspath(state_dir / "transactions"))
+        tx_dir = Path(os.path.abspath(tx_dir))
+        if tx_dir.parent != expected_root:
+            raise SafetyError("Transaction is outside the managed transaction directory")
+        tx_dirfd = open_directory_fd(tx_dir)
         try:
-            tx_dir.resolve(strict=False).relative_to(expected_root)
-        except ValueError as exc:
-            raise SafetyError("Transaction is outside the managed transaction directory") from exc
-        journal = tx_dir / "journal.json"
-        st = os.lstat(journal)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-            raise SafetyError("Unsafe transaction journal")
-        payload = json.loads(journal.read_text(encoding="utf-8"))
-        changes = [Change(**item) for item in payload["changes"]]
-        rollback_changes(tx_dir, changes)
-        marker = tx_dir / "ROLLED_BACK"
-        marker.write_text(f"{time.time_ns()}\n", encoding="ascii")
-        os.chmod(marker, 0o600)
-        fsync_directory(tx_dir)
+            journal_data, _journal_fp = read_regular_at(
+                tx_dirfd, "journal.json", tx_dir / "journal.json"
+            )
+            assert journal_data is not None
+            payload = json.loads(journal_data.decode("utf-8"))
+            changes = [Change(**item) for item in payload["changes"]]
+            rollback_changes(tx_dir, changes, tx_dirfd=tx_dirfd)
+            write_new_regular_at(
+                tx_dirfd, "ROLLED_BACK", f"{time.time_ns()}\n".encode("ascii"), 0o600
+            )
+            os.fsync(tx_dirfd)
+        finally:
+            os.close(tx_dirfd)
     finally:
         os.close(lock_fd)
 
